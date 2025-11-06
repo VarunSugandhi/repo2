@@ -15,6 +15,7 @@ import MindMapVisualization from "@/components/MindMapVisualization";
 import MindMapFlow from "@/components/MindMapFlow";
 import JSZip from "jszip";
 import jsPDF from "jspdf";
+import Flashcards, { type Flashcard } from "@/components/Flashcards";
 
 interface Source {
   id: string;
@@ -68,6 +69,8 @@ const Workspace = () => {
   const [combinedAudioUrl, setCombinedAudioUrl] = useState<string | null>(null);
   const [combining, setCombining] = useState(false);
   const [selectedKeyPoint, setSelectedKeyPoint] = useState<string | null>(null);
+  const [flashcards, setFlashcards] = useState<Flashcard[]>([]);
+  const [generatingFlashcards, setGeneratingFlashcards] = useState(false);
 
   // Inline rename support for notebook header
   const [renamingTitle, setRenamingTitle] = useState(false);
@@ -221,6 +224,26 @@ const Workspace = () => {
     }
   }, [notebookId]);
 
+  // Auto-generate summary for notes when sources are loaded
+  useEffect(() => {
+    if (sources.length > 0 && !summary && !generating) {
+      // Check if any source is a note (not a question paper)
+      const noteSources = sources.filter(s => 
+        !s.content.toLowerCase().includes('question paper') &&
+        !s.content.toLowerCase().includes('question') &&
+        !s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+      );
+      
+      if (noteSources.length > 0) {
+        // Combine all note content
+        const combinedContent = noteSources.map(s => s.content).join('\n\n');
+        if (combinedContent.trim()) {
+          generateSummary(combinedContent, true); // true indicates it's a note
+        }
+      }
+    }
+  }, [sources]);
+
   const fetchLatestSummary = async () => {
     const { data, error } = await supabase
       .from("summaries")
@@ -288,6 +311,25 @@ const Workspace = () => {
 
     if (!error && data) {
       setSources(data);
+      
+      // Auto-generate summary for notes if no summary exists
+      if (data.length > 0 && !summary) {
+        const noteSources = data.filter(s => 
+          !s.content.toLowerCase().includes('question paper') &&
+          !s.content.toLowerCase().includes('question') &&
+          !s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+        );
+        
+        if (noteSources.length > 0) {
+          const combinedContent = noteSources.map(s => s.content).join('\n\n');
+          if (combinedContent.trim() && !generating) {
+            generateSummary(combinedContent, true); // true indicates it's a note
+          }
+        }
+      }
+      
+      // Auto-generate flashcards when summary is available
+      // This will be triggered after summary generation completes
     }
   };
 
@@ -384,12 +426,15 @@ const Workspace = () => {
     }
   };
 
-  const generateSummary = async (content: string) => {
+  const generateSummary = async (content: string, isNote: boolean = false) => {
     setGenerating(true);
 
     try {
+      // Use 'exam' mode for notes to get better structured summaries
+      const mode = isNote ? "exam" : "standard";
+      
       const { data, error } = await supabase.functions.invoke("generate-summary", {
-        body: { text: content, mode: "standard" },
+        body: { text: content, mode },
       });
 
       if (error) throw error;
@@ -412,6 +457,14 @@ const Workspace = () => {
 
       toast.success("Summary generated!");
 
+      // Auto-generate flashcards based on summary (for all notebooks)
+      // Wait a bit for summary to be set, then generate flashcards
+      setTimeout(async () => {
+        if (data.summary && data.keyPoints && data.keyPoints.length > 0) {
+          await generateFlashcardsFromPaper(data.summary);
+        }
+      }, 1000);
+
       // Fetch YouTube learning links based on extracted headings/subheadings
       try {
         const yt = await supabase.functions.invoke("fetch-research-links", { body: { summary: data.summary } });
@@ -426,6 +479,141 @@ const Workspace = () => {
       toast.error(`Failed to generate summary: ${message}`);
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const generateFlashcardsFromPaper = async (paperContent: string) => {
+    setGeneratingFlashcards(true);
+    try {
+      // Use AI to generate flashcards based on summary and key points
+      const contentToAnalyze = summary || paperContent;
+      const keyPointsText = keyPoints.length > 0 ? keyPoints.join('\n') : '';
+      
+      if (!contentToAnalyze && !keyPointsText) {
+        toast.error("No content available to generate flashcards");
+        return;
+      }
+
+      // Use Supabase function to generate flashcards via AI
+      const { data, error } = await supabase.functions.invoke("generate-flashcards", {
+        body: { 
+          summary: contentToAnalyze,
+          keyPoints: keyPoints,
+        },
+      });
+
+      if (error) throw error;
+
+      if (data.error) {
+        toast.error(data.error);
+        return;
+      }
+
+      // Parse flashcards from AI response
+      let extractedFlashcards: Flashcard[] = [];
+      
+      if (data.flashcards && Array.isArray(data.flashcards)) {
+        extractedFlashcards = data.flashcards.map((fc: any, idx: number) => ({
+          id: `fc-${idx}`,
+          front: fc.front || fc.question || fc.concept || 'Question',
+          back: fc.back || fc.answer || fc.explanation || 'Answer',
+          topic: fc.topic || fc.subject || 'General',
+          difficulty: (fc.difficulty || 'medium') as 'easy' | 'medium' | 'hard',
+        }));
+      }
+
+      if (extractedFlashcards.length > 0) {
+        setFlashcards(extractedFlashcards);
+        toast.success(`Generated ${extractedFlashcards.length} flashcards!`);
+      } else {
+        // Fallback: Create flashcards from key points
+        if (keyPoints.length > 0) {
+          const fallbackFlashcards = keyPoints.slice(0, 10).map((kp, idx) => ({
+            id: `fc-${idx}`,
+            front: kp.split(':')[0] || kp.substring(0, 50) || 'Question',
+            back: kp.split(':').slice(1).join(':') || kp || 'Answer',
+            topic: 'Key Concepts',
+            difficulty: 'medium' as const,
+          }));
+          setFlashcards(fallbackFlashcards);
+          toast.success(`Created ${fallbackFlashcards.length} flashcards from key points!`);
+        } else {
+          toast.error("Could not generate flashcards. Please ensure summary is generated first.");
+        }
+      }
+    } catch (error) {
+      console.error("Error generating flashcards:", error);
+      // Fallback: Create flashcards from key points
+      if (keyPoints.length > 0) {
+        const fallbackFlashcards = keyPoints.slice(0, 10).map((kp, idx) => ({
+          id: `fc-${idx}`,
+          front: kp.split(':')[0] || kp.substring(0, 50) || 'Question',
+          back: kp.split(':').slice(1).join(':') || kp || 'Answer',
+          topic: 'Key Concepts',
+          difficulty: 'medium' as const,
+        }));
+        setFlashcards(fallbackFlashcards);
+        toast.success(`Created ${fallbackFlashcards.length} flashcards from key points!`);
+      } else {
+        toast.error("Failed to generate flashcards. Please try again.");
+      }
+    } finally {
+      setGeneratingFlashcards(false);
+    }
+  };
+
+  const extractConceptsFromText = (content: string, summary: string): Array<{name: string; explanation: string; topic: string; difficulty: 'easy' | 'medium' | 'hard'}> => {
+    const concepts: Array<{name: string; explanation: string; topic: string; difficulty: 'easy' | 'medium' | 'hard'}> = [];
+    
+    // Extract mathematical formulas
+    const formulaRegex = /([A-Za-z]+\s*=\s*[^,\n]+)/g;
+    const formulas = content.match(formulaRegex) || [];
+    formulas.slice(0, 5).forEach((formula, idx) => {
+      concepts.push({
+        name: `Formula ${idx + 1}`,
+        explanation: formula,
+        topic: 'Formulas',
+        difficulty: 'medium',
+      });
+    });
+
+    // Extract definitions (look for patterns like "X is Y" or "X: Y")
+    const definitionRegex = /([A-Z][^:\.]+):\s*([^\.\n]+)/g;
+    let match;
+    let defCount = 0;
+    while ((match = definitionRegex.exec(content)) !== null && defCount < 5) {
+      concepts.push({
+        name: match[1].trim(),
+        explanation: match[2].trim(),
+        topic: 'Definitions',
+        difficulty: 'easy',
+      });
+      defCount++;
+    }
+
+    // Extract key topics from summary
+    const topicRegex = /(?:topic|concept|subject|chapter):\s*([^\n,]+)/gi;
+    const topics = summary.match(topicRegex) || [];
+    topics.slice(0, 5).forEach((topic, idx) => {
+      const topicName = topic.replace(/topic|concept|subject|chapter:/gi, '').trim();
+      concepts.push({
+        name: topicName,
+        explanation: `Important concept from the question paper`,
+        topic: 'Key Topics',
+        difficulty: 'medium',
+      });
+    });
+
+    return concepts.slice(0, 10);
+  };
+
+  const handleGenerateFlashcards = async () => {
+    // Generate flashcards based on summary and key points
+    if (summary || keyPoints.length > 0) {
+      const allContent = summary || sources.map(s => s.content).join('\n\n');
+      await generateFlashcardsFromPaper(allContent);
+    } else {
+      toast.error("Please generate a summary first to create flashcards");
     }
   };
 
@@ -1102,7 +1290,25 @@ const Workspace = () => {
               </Button>
             </div>
 
-            <div className="mt-6">
+            {/* Flashcards Section */}
+            <div className="mt-6 border-t border-border pt-4">
+              <div className="mb-3">
+                <h3 className="text-sm font-semibold mb-1">📚 Flashcards</h3>
+                <p className="text-xs text-muted-foreground">
+                  AI-generated questions and answers from summary
+                </p>
+              </div>
+              <div className="h-[400px] border border-border rounded-lg p-3 bg-card">
+                <Flashcards
+                  flashcards={flashcards}
+                  onGenerate={handleGenerateFlashcards}
+                  generating={generatingFlashcards}
+                />
+              </div>
+            </div>
+
+            {/* Added Sources Section */}
+            <div className="mt-6 border-t border-border pt-4">
               <p className="text-sm font-medium mb-3">Added Sources ({sources.length})</p>
               <div className="space-y-2">
                 {sources.map((source) => (
@@ -1121,7 +1327,7 @@ const Workspace = () => {
       </div>
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col bg-gradient-to-b from-background/80 to-card/90 rounded-t-2xl border border-border/60 shadow-xl backdrop-blur-md transition-all duration-400 font-[Gill_Sans] tracking-wide overflow-hidden">
         <div className="p-6 border-b border-border">
           <div className="flex items-start gap-3">
             <div className="h-12 w-12 rounded bg-gradient-primary flex items-center justify-center flex-shrink-0">
@@ -1187,67 +1393,70 @@ const Workspace = () => {
                     </div>
 
                     <div className="prose dark:prose-invert max-w-none">
-                      <div className="mb-6">
-                        <h1 className="text-2xl font-bold mb-4 text-foreground">
-                          {(() => {
-                            const knownPhrases = [
-                              'gen ai', 'artificial intelligence', 'machine learning', 'deep learning', 'neural network', 'supply chain', 'blockchain', 'big data', 'data science', 'natural language', 'computer vision', 'internet of things', 'iot', 'cloud computing', 'edge computing', 'cyber security', 'quantum computing'
-                            ];
-                            // Stopwords—expanded
-                            const stopwords = new Set([
-                              'the','a','an','to','and','or','of','in','for','on','this','that','is','be','are','being','by','with','at','from','as','was','were','it','which','if','not','but','has','have','had','can','will','would','should','may','might','could','do','does','done','about','into','been','was','their','its','also','we','i','you','our','they','he','she','them','his','her','us','so','than','these','those','such','more','most','some','other','all','over','new','used','using','use','because','among','between','through','per','each','within','after','before','one','two','three','first','second','third','file','document','prompt','user','say','output','extracted','content','summary','main','provide','please','introduction','extract','v1.0']
-                            );
-                            let text = summary || '';
-                            // Try: first line/heading that isn't generic
-                            const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-                            for (let line of lines) {
-                              const simple = line.replace(/^[\*•#\-.\s]+/, '').replace(/[^\w\s%]/g, '').trim().toLowerCase();
-                              if (!simple) continue;
-                              // look for phrase match
-                              const matchedPhrase = knownPhrases.find(phrase => simple.includes(phrase));
-                              if (matchedPhrase) return matchedPhrase;
-                              // Heuristic: should be 3-8 words, not all caps, not all stopwords, not "introduction" etc
-                              const ws = line.split(/\s+/).filter(w => !!w);
-                              if (ws.length < 3 || ws.length > 8) continue;
-                              if (ws.every(w => stopwords.has(w.toLowerCase()))) continue;
-                              if (/^[A-Z \-]+$/.test(line)) continue; // skip ALLCAPS
-                              if (['introduction','extract','summary','content','document'].includes(simple)) continue;
-                              return ws.map(w => w.replace(/[^a-zA-Z0-9]/g, '')).join(' ');
-                            }
-                            // Fallback to previous keyword freq extraction:
-                            text = text.replace(/[\*•#>\-_`~\[\](){}:\/"',.?!;0-9]/g,' ').toLowerCase();
-                            const freq = {};
-                            text.split(/\s+/).forEach(w => {
-                              if (w.length < 2) return;
-                              if (stopwords.has(w)) return;
-                              freq[w] = (freq[w] || 0) + 1;
-                            });
-                            const sortedWords = Object.keys(freq)
-                              .sort((a,b) => freq[b]-freq[a] || text.indexOf(a) - text.indexOf(b));
-                            let topic = '';
-                            if (text.includes('gen ai')) { topic = 'gen ai'; }
-                            else if (text.includes('artificial intelligence')) { topic = 'artificial intelligence'; }
-                            else if (sortedWords.length) { topic = sortedWords.slice(0,3).join(' '); }
-                            else { topic = (getSummaryMainHeading(summary, notebook?.title)||'').split(/\s+/).slice(0,3).join(' '); }
-                            return topic.trim();
-                          })()}
-                        </h1>
-                        <div className="text-lg leading-relaxed">
-                          <ReactMarkdown 
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
-                            }}
-                          >
-                            {summary}
-                          </ReactMarkdown>
+                      <div className="mb-6 bg-gradient-to-br from-primary/10 to-muted/30 rounded-2xl shadow-lg p-8 border border-border transition-all duration-500 animate-fade-in font-[Gill_Sans] tracking-wide backdrop-blur-md drop-shadow-xl overflow-hidden relative">
+                        <div className="absolute inset-0 pointer-events-none animate-shimmer opacity-80 z-[1]" />
+                        <div className="relative z-[2]">
+                          <h1 className="text-2xl font-bold mb-4 text-foreground">
+                            {(() => {
+                              const knownPhrases = [
+                                'gen ai', 'artificial intelligence', 'machine learning', 'deep learning', 'neural network', 'supply chain', 'blockchain', 'big data', 'data science', 'natural language', 'computer vision', 'internet of things', 'iot', 'cloud computing', 'edge computing', 'cyber security', 'quantum computing'
+                              ];
+                              // Stopwords—expanded
+                              const stopwords = new Set([
+                                'the','a','an','to','and','or','of','in','for','on','this','that','is','be','are','being','by','with','at','from','as','was','were','it','which','if','not','but','has','have','had','can','will','would','should','may','might','could','do','does','done','about','into','been','was','their','its','also','we','i','you','our','they','he','she','them','his','her','us','so','than','these','those','such','more','most','some','other','all','over','new','used','using','use','because','among','between','through','per','each','within','after','before','one','two','three','first','second','third','file','document','prompt','user','say','output','extracted','content','summary','main','provide','please','introduction','extract','v1.0']
+                              );
+                              let text = summary || '';
+                              // Try: first line/heading that isn't generic
+                              const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+                              for (let line of lines) {
+                                const simple = line.replace(/^[\*•#\-.\s]+/, '').replace(/[^\w\s%]/g, '').trim().toLowerCase();
+                                if (!simple) continue;
+                                // look for phrase match
+                                const matchedPhrase = knownPhrases.find(phrase => simple.includes(phrase));
+                                if (matchedPhrase) return matchedPhrase;
+                                // Heuristic: should be 3-8 words, not all caps, not all stopwords, not "introduction" etc
+                                const ws = line.split(/\s+/).filter(w => !!w);
+                                if (ws.length < 3 || ws.length > 8) continue;
+                                if (ws.every(w => stopwords.has(w.toLowerCase()))) continue;
+                                if (/^[A-Z \-]+$/.test(line)) continue; // skip ALLCAPS
+                                if (['introduction','extract','summary','content','document'].includes(simple)) continue;
+                                return ws.map(w => w.replace(/[^a-zA-Z0-9]/g, '')).join(' ');
+                              }
+                              // Fallback to previous keyword freq extraction:
+                              text = text.replace(/[\*•#>\-_`~\[\](){}:\/"',.?!;0-9]/g,' ').toLowerCase();
+                              const freq = {};
+                              text.split(/\s+/).forEach(w => {
+                                if (w.length < 2) return;
+                                if (stopwords.has(w)) return;
+                                freq[w] = (freq[w] || 0) + 1;
+                              });
+                              const sortedWords = Object.keys(freq)
+                                .sort((a,b) => freq[b]-freq[a] || text.indexOf(a) - text.indexOf(b));
+                              let topic = '';
+                              if (text.includes('gen ai')) { topic = 'gen ai'; }
+                              else if (text.includes('artificial intelligence')) { topic = 'artificial intelligence'; }
+                              else if (sortedWords.length) { topic = sortedWords.slice(0,3).join(' '); }
+                              else { topic = (getSummaryMainHeading(summary, notebook?.title)||'').split(/\s+/).slice(0,3).join(' '); }
+                              return topic.trim();
+                            })()}
+                          </h1>
+                          <div className="text-lg leading-relaxed">
+                            <ReactMarkdown 
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+                              }}
+                            >
+                              {summary}
+                            </ReactMarkdown>
+                          </div>
                         </div>
                       </div>
 
                       {keyPoints.length > 0 && (
                         <div className="bg-accent/20 rounded-lg p-6 border border-border">
                           <h3 className="text-xl font-semibold mb-4">📊 Key Points</h3>
-                          <ul className="space-y-2">
+                          <ul className="space-y-2 mb-6">
                             {keyPoints.map((point, idx) => (
                               <li
                                 key={idx}
@@ -1258,6 +1467,98 @@ const Workspace = () => {
                               </li>
                             ))}
                           </ul>
+
+                          {/* Chat Interface in Key Points Section */}
+                          <div className="mt-6 border-t border-border pt-6">
+                            <div className="mb-4">
+                              <h3 className="text-lg font-semibold mb-2">💬 AI Study Assistant</h3>
+                              <p className="text-sm text-muted-foreground">
+                                Ask questions about the summary, get clarifications, or dive deeper into concepts!
+                              </p>
+                            </div>
+
+                            {chatMessages.length > 0 && (
+                              <div className="space-y-3 max-h-[300px] overflow-y-auto mb-4">
+                                {chatMessages.map((msg, idx) => (
+                                  <div
+                                    key={idx}
+                                    className={`flex gap-2 ${
+                                      msg.role === "user" ? "justify-end" : "justify-start"
+                                    }`}
+                                  >
+                                    {msg.role === "assistant" && (
+                                      <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center flex-shrink-0 text-xs">
+                                        🤖
+                                      </div>
+                                    )}
+                                    <div
+                                      className={`max-w-[75%] p-3 rounded-lg text-sm ${
+                                        msg.role === "user"
+                                          ? "bg-primary text-primary-foreground"
+                                          : "bg-muted/50"
+                                      }`}
+                                    >
+                                      <p className="font-semibold mb-1 text-xs">
+                                        {msg.role === "user" ? "You" : "AI Tutor"}
+                                      </p>
+                                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                                    </div>
+                                    {msg.role === "user" && (
+                                      <div className="h-6 w-6 rounded-full bg-secondary flex items-center justify-center flex-shrink-0 text-xs">
+                                        👤
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                                {chatLoading && (
+                                  <div className="flex gap-2 justify-start">
+                                    <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center">
+                                      🤖
+                                    </div>
+                                    <div className="bg-muted/50 p-3 rounded-lg">
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="flex gap-2">
+                              <Input
+                                placeholder="Ask about the summary, concepts, or get clarifications..."
+                                value={message}
+                                onChange={(e) => setMessage(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleSendMessage();
+                                  }
+                                }}
+                                disabled={chatLoading}
+                                className="flex-1 text-sm"
+                                size="sm"
+                              />
+                              <Button
+                                onClick={handleSendMessage}
+                                disabled={!message.trim() || chatLoading}
+                                className="bg-gradient-primary"
+                                size="sm"
+                              >
+                                {chatLoading ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Send className="h-4 w-4" />
+                                )}
+                              </Button>
+                            </div>
+
+                            {chatMessages.length === 0 && (
+                              <div className="text-center py-4 text-muted-foreground mt-4">
+                                <p className="text-sm">Start a conversation with AI!</p>
+                                <p className="text-xs mt-1">Try asking: "Explain this concept" or "What are the key takeaways?"</p>
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1468,24 +1769,275 @@ const Workspace = () => {
               </Tabs>
             )}
 
-            {chatMessages.length > 0 && (
-              <div className="mt-8 space-y-4">
-                <h3 className="text-lg font-semibold">Chat History</h3>
-                {chatMessages.map((msg, idx) => (
-                  <div
-                    key={idx}
-                    className={`p-4 rounded-lg ${
-                      msg.role === "user"
-                        ? "bg-primary/10 ml-12"
-                        : "bg-muted/50 mr-12"
-                    }`}
-                  >
-                    <p className="font-semibold mb-1">
-                      {msg.role === "user" ? "You" : "AI Tutor"}
-                    </p>
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+            {/* Display Question Papers Content */}
+            {sources.length > 0 && sources.some(s => 
+              s.content.toLowerCase().includes('question') ||
+              s.content.toLowerCase().includes('paper') ||
+              s.content.toLowerCase().includes('exam') ||
+              s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+            ) && (
+              <div className="mb-6">
+                <h2 className="text-2xl font-semibold mb-4">📄 Question Papers</h2>
+                <div className="space-y-4">
+                  {sources.filter(s => 
+                    s.content.toLowerCase().includes('question') ||
+                    s.content.toLowerCase().includes('paper') ||
+                    s.content.toLowerCase().includes('exam') ||
+                    s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+                  ).map((source) => (
+                    <div key={source.id} className="bg-card border border-border rounded-lg p-6">
+                      <h3 className="text-xl font-semibold mb-4">{source.title}</h3>
+                      <div className="prose dark:prose-invert max-w-none whitespace-pre-wrap text-sm">
+                        {source.content}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                
+                {/* Key Points for Question Papers */}
+                {keyPoints.length > 0 && (
+                  <div className="mt-4 p-4 bg-primary/10 rounded-lg border border-primary/20">
+                    <h3 className="text-lg font-semibold mb-3">📊 Key Points</h3>
+                    <ul className="space-y-2">
+                      {keyPoints.map((point, idx) => (
+                        <li
+                          key={idx}
+                          className="flex items-start gap-2 text-sm"
+                        >
+                          <span className="text-primary font-semibold mt-0.5">•</span>
+                          <span className="flex-1">{point.replace(/^[*•.-]+\s*/, '').replace(/[*•.-]+$/, '').trim()}</span>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
-                ))}
+                )}
+
+                {/* Chat Interface for Question Papers */}
+                <div className="mt-4 p-4 bg-primary/10 rounded-lg border border-primary/20">
+                  <div className="mb-4">
+                    <h3 className="text-lg font-semibold mb-2">💬 AI Study Assistant</h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Ask questions about solving these problems, get step-by-step solutions, or clarify concepts!
+                    </p>
+                  </div>
+
+                  {chatMessages.length > 0 && (
+                    <div className="space-y-3 max-h-[300px] overflow-y-auto mb-4">
+                      {chatMessages.map((msg, idx) => (
+                        <div
+                          key={idx}
+                          className={`flex gap-2 ${
+                            msg.role === "user" ? "justify-end" : "justify-start"
+                          }`}
+                        >
+                          {msg.role === "assistant" && (
+                            <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center flex-shrink-0 text-xs">
+                              🤖
+                            </div>
+                          )}
+                          <div
+                            className={`max-w-[75%] p-3 rounded-lg text-sm ${
+                              msg.role === "user"
+                                ? "bg-primary text-primary-foreground"
+                                : "bg-muted/50"
+                            }`}
+                          >
+                            <p className="font-semibold mb-1 text-xs">
+                              {msg.role === "user" ? "You" : "AI Tutor"}
+                            </p>
+                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                          </div>
+                          {msg.role === "user" && (
+                            <div className="h-6 w-6 rounded-full bg-secondary flex items-center justify-center flex-shrink-0 text-xs">
+                              👤
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                      {chatLoading && (
+                        <div className="flex gap-2 justify-start">
+                          <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center">
+                            🤖
+                          </div>
+                          <div className="bg-muted/50 p-3 rounded-lg">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="Ask about questions, get solutions, or clarify concepts..."
+                      value={message}
+                      onChange={(e) => setMessage(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      disabled={chatLoading}
+                      className="flex-1 text-sm"
+                      size="sm"
+                    />
+                    <Button
+                      onClick={handleSendMessage}
+                      disabled={!message.trim() || chatLoading}
+                      className="bg-gradient-primary"
+                      size="sm"
+                    >
+                      {chatLoading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Send className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
+
+                  {chatMessages.length === 0 && (
+                    <div className="text-center py-4 text-muted-foreground mt-4">
+                      <p className="text-sm">Start a conversation with AI!</p>
+                      <p className="text-xs mt-1">Try asking: "How do I solve question 1?" or "Explain this concept"</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Display Notes Content */}
+            {sources.length > 0 && sources.some(s => 
+              !s.content.toLowerCase().includes('question paper') &&
+              !s.content.toLowerCase().includes('question') &&
+              !s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+            ) && !summary && (
+              <div className="mb-6">
+                <h2 className="text-2xl font-semibold mb-4">📝 Study Notes</h2>
+                <div className="space-y-4">
+                  {sources.filter(s => 
+                    !s.content.toLowerCase().includes('question paper') &&
+                    !s.content.toLowerCase().includes('question') &&
+                    !s.content.toLowerCase().match(/\d+\.\s*(question|q\.)/i)
+                  ).map((source) => (
+                    <div key={source.id} className="bg-card border border-border rounded-lg p-6">
+                      <h3 className="text-xl font-semibold mb-4">{source.title}</h3>
+                      <div className="prose dark:prose-invert max-w-none whitespace-pre-wrap">
+                        {source.content}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                
+                {/* Key Points for Notes */}
+                {keyPoints.length > 0 && (
+                  <div className="mt-4 p-4 bg-primary/10 rounded-lg border border-primary/20">
+                    <h3 className="text-lg font-semibold mb-3">📊 Key Points</h3>
+                    <ul className="space-y-2">
+                      {keyPoints.map((point, idx) => (
+                        <li
+                          key={idx}
+                          className="flex items-start gap-2 text-sm"
+                        >
+                          <span className="text-primary font-semibold mt-0.5">•</span>
+                          <span className="flex-1">{point.replace(/^[*•.-]+\s*/, '').replace(/[*•.-]+$/, '').trim()}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Chat Interface for Notes */}
+                <div className="mt-4 p-4 bg-primary/10 rounded-lg border border-primary/20">
+                  <div className="mb-4">
+                    <h3 className="text-lg font-semibold mb-2">💬 AI Study Assistant</h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Ask questions about the notes, get clarifications, or dive deeper into concepts!
+                    </p>
+                  </div>
+
+                  {chatMessages.length > 0 && (
+                    <div className="space-y-3 max-h-[300px] overflow-y-auto mb-4">
+                      {chatMessages.map((msg, idx) => (
+                        <div
+                          key={idx}
+                          className={`flex gap-2 ${
+                            msg.role === "user" ? "justify-end" : "justify-start"
+                          }`}
+                        >
+                          {msg.role === "assistant" && (
+                            <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center flex-shrink-0 text-xs">
+                              🤖
+                            </div>
+                          )}
+                          <div
+                            className={`max-w-[75%] p-3 rounded-lg text-sm ${
+                              msg.role === "user"
+                                ? "bg-primary text-primary-foreground"
+                                : "bg-muted/50"
+                            }`}
+                          >
+                            <p className="font-semibold mb-1 text-xs">
+                              {msg.role === "user" ? "You" : "AI Tutor"}
+                            </p>
+                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                          </div>
+                          {msg.role === "user" && (
+                            <div className="h-6 w-6 rounded-full bg-secondary flex items-center justify-center flex-shrink-0 text-xs">
+                              👤
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                      {chatLoading && (
+                        <div className="flex gap-2 justify-start">
+                          <div className="h-6 w-6 rounded-full bg-primary flex items-center justify-center">
+                            🤖
+                          </div>
+                          <div className="bg-muted/50 p-3 rounded-lg">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="Ask about the notes, concepts, or get clarifications..."
+                      value={message}
+                      onChange={(e) => setMessage(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      disabled={chatLoading}
+                      className="flex-1 text-sm"
+                      size="sm"
+                    />
+                    <Button
+                      onClick={handleSendMessage}
+                      disabled={!message.trim() || chatLoading}
+                      className="bg-gradient-primary"
+                      size="sm"
+                    >
+                      {chatLoading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Send className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
+
+                  {chatMessages.length === 0 && (
+                    <div className="text-center py-4 text-muted-foreground mt-4">
+                      <p className="text-sm">Start a conversation with AI!</p>
+                      <p className="text-xs mt-1">Try asking: "Explain this concept" or "What are the key takeaways?"</p>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
